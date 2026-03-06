@@ -9,9 +9,11 @@ Automates the IDIA MeerKAT calibration and imaging pipeline:
   5. Generate sbatch scripts
   6. Apply sbatch overrides
   7. Submit calibration
-  8. Submit verification job (afterany:last_cal_job)
-  9. Submit imaging jobs (afterok:verify_job)
- 10. Submit image-move job (afterany:last_imaging_job)
+  8. Submit calibration verification job (afterany:last_cal_job)
+  9. Submit imaging jobs (afterok:verify_cal_job)
+ 10. Submit imaging verification job (afterany:all_imaging_jobs)
+ 11. Submit linmos mosaicking job (afterok:verify_imaging_job)
+ 12. Submit image-move job (afterany:linmos_job)
 
 Usage:
     ./run_vela.py -i <obs_id> [--setup-only] [--skip-imaging] [--force] [--config <modifier.ini>]
@@ -43,6 +45,8 @@ IMAGES_BASE = '/idia/projects/vela-mc-blos/images'
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MODIFIER = os.path.join(SCRIPT_DIR, 'vela_config_modifier.ini')
 VERIFY_SCRIPT = os.path.join(SCRIPT_DIR, 'verify_calibration.py')
+VERIFY_IMAGING_SCRIPT = os.path.join(SCRIPT_DIR, 'verify_imaging.py')
+LINMOS_SCRIPT = os.path.join(SCRIPT_DIR, 'run_linmos.py')
 PIPELINE_CMD = 'processMeerKAT.py'
 
 
@@ -372,15 +376,65 @@ def main():
         else:
             print("Warning: could not parse imaging job IDs for {}".format(field))
 
-    last_imaging_job = all_last_imaging_jobs[-1] if all_last_imaging_jobs else None
-
-    # Step 10: Submit image-move job (afterany:all imaging jobs)
+    # Step 10: Submit imaging verification job (afterany:all imaging jobs)
+    verify_img_job_id = None
     if all_last_imaging_jobs:
-        # Depend on all per-field imaging jobs completing
         imaging_dep = ':'.join(all_last_imaging_jobs)
 
+        verify_img_sbatch = os.path.join(work_dir, 'verify_imaging.sbatch')
+        verify_img_cmd = 'python3 {} --obs-id {} --work-dir {}'.format(
+            VERIFY_IMAGING_SCRIPT, obs_id, work_dir)
+        write_sbatch_script(
+            verify_img_sbatch,
+            job_name='verify_img_{}'.format(obs_id),
+            command=verify_img_cmd,
+            account=account,
+            time='00:10:00',
+            mem='4GB',
+        )
+        verify_img_job_id = submit_sbatch(
+            verify_img_sbatch, dependency=imaging_dep, dep_type='afterany')
+        if verify_img_job_id is None:
+            print("ERROR: failed to submit imaging verification job")
+            sys.exit(1)
+        print("Imaging verification job submitted: {} (afterany:{})".format(
+            verify_img_job_id, imaging_dep))
+
+    # Step 11: Submit linmos mosaicking job (afterok:verify_imaging)
+    linmos_job_id = None
+    if verify_img_job_id:
+        container = modifier_sections.get('slurm', {}).get(
+            'container', '/idia/software/containers/casa-6.5.0-modular.sif')
+        linmos_cmd = 'singularity exec {} python3 {} --work-dir {}'.format(
+            container, LINMOS_SCRIPT, work_dir)
+        linmos_sbatch = os.path.join(work_dir, 'linmos.sbatch')
+        write_sbatch_script(
+            linmos_sbatch,
+            job_name='linmos_{}'.format(obs_id),
+            command=linmos_cmd,
+            account=account,
+            time='02:00:00',
+            mem='64GB',
+        )
+        linmos_job_id = submit_sbatch(
+            linmos_sbatch, dependency=verify_img_job_id, dep_type='afterok')
+        if linmos_job_id:
+            print("Linmos job submitted: {} (afterok:{})".format(
+                linmos_job_id, verify_img_job_id))
+        else:
+            print("Warning: failed to submit linmos job")
+
+    # Step 12: Submit image-move job (afterany:linmos or afterany:all imaging jobs)
+    move_job_id = None
+    if all_last_imaging_jobs:
+        # Depend on linmos if it was submitted, otherwise on imaging jobs
+        if linmos_job_id:
+            move_dep = linmos_job_id
+        else:
+            move_dep = ':'.join(all_last_imaging_jobs)
+
         images_dest = os.path.join(IMAGES_BASE, obs_id)
-        # Collect images from all per-field imaging directories
+        # Collect images from all per-field imaging directories + mosaic
         copy_lines = [
             'set -e',
             'mkdir -p {}'.format(images_dest),
@@ -400,6 +454,15 @@ def main():
                 '    fi',
                 'done',
             ])
+        # Copy mosaic products
+        copy_lines.extend([
+            '# Copy mosaic products',
+            'for mosaic in {}/mosaic.*; do'.format(work_dir),
+            '    if [ -e "$mosaic" ]; then',
+            '        cp -r "$mosaic" {}/'.format(images_dest),
+            '    fi',
+            'done',
+        ])
         copy_lines.append('echo "Images moved to {}"'.format(images_dest))
         move_cmd = '\n'.join(copy_lines)
 
@@ -413,10 +476,10 @@ def main():
             mem='8GB',
         )
         move_job_id = submit_sbatch(
-            move_sbatch, dependency=imaging_dep, dep_type='afterany')
+            move_sbatch, dependency=move_dep, dep_type='afterany')
         if move_job_id:
             print("Image-move job submitted: {} (afterany:{})".format(
-                move_job_id, imaging_dep))
+                move_job_id, move_dep))
         else:
             print("Warning: failed to submit image-move job")
 
@@ -425,15 +488,18 @@ def main():
     print("Pipeline submitted successfully!")
     print("SLURM dependency chain:")
     print("  Calibration (last job: {})".format(cal_final_job_id))
-    print("    -> Verification (job: {})".format(verify_job_id))
+    print("    -> Verify calibration (job: {})".format(verify_job_id))
     if not args.skip_imaging and all_last_imaging_jobs:
         print("    -> Imaging ({} fields, {} jobs):".format(
             len(target_fields), len(all_last_imaging_jobs)))
         for field, job in zip(target_fields, all_last_imaging_jobs):
             print("         {} (last job: {})".format(field, job))
-        if 'move_job_id' in dir() and move_job_id:
-            print("    -> Move images (job: {}, afterany:{})".format(
-                move_job_id, ':'.join(all_last_imaging_jobs)))
+        if verify_img_job_id:
+            print("    -> Verify imaging (job: {})".format(verify_img_job_id))
+        if linmos_job_id:
+            print("    -> Linmos mosaic (job: {})".format(linmos_job_id))
+        if move_job_id:
+            print("    -> Move images (job: {})".format(move_job_id))
     print("\nMonitor with: squeue -u $USER")
     print("Working directory: {}".format(work_dir))
     print("=" * 60)

@@ -20,7 +20,7 @@ image archival, all linked via SLURM job dependencies.
 ./run_vela.py -i <obs_id>
 ```
 
-Runs all 10 steps end-to-end:
+Runs all 12 steps end-to-end:
 
 | Step | What happens |
 |------|-------------|
@@ -31,9 +31,11 @@ Runs all 10 steps end-to-end:
 | 5 | Generate sbatch scripts via `processMeerKAT.py -R` |
 | 6 | Apply per-script SLURM resource overrides (`[sbatch_overrides]`) |
 | 7 | Submit the calibration pipeline |
-| 8 | Submit a verification job (checks caltables and MMS files) |
+| 8 | Submit a calibration verification job (checks caltables and MMS files) |
 | 9 | Submit imaging jobs — one independent job per target field, all in parallel |
-| 10 | Submit an image-move job that copies results to `/idia/projects/vela-mc-blos/images/<obs_id>/` |
+| 10 | Submit an imaging verification job (checks for `*.image` and `*.pb` products) |
+| 11 | Submit a linmos mosaicking job (combines per-field images into a single mosaic) |
+| 12 | Submit an image-move job that copies per-field images + mosaic to `/idia/projects/vela-mc-blos/images/<obs_id>/` |
 
 ### Setup only (inspect before submitting)
 
@@ -80,20 +82,25 @@ The format is the same — see [Configuration](#configuration) below.
 ```
 Calibration (chained internally by submit_pipeline.sh)
     └── verify_cal (afterany:last_cal_job)
-            └── imaging_Vela_00 (afterok:verify_job)  ─┐
-                imaging_Vela_01 (afterok:verify_job)   │  all run
-                imaging_Vela_02 (afterok:verify_job)   ├─ in parallel
+            └── imaging_Vela_00 (afterok:verify_cal)  ─┐
+                imaging_Vela_01 (afterok:verify_cal)   │  all run
+                imaging_Vela_02 (afterok:verify_cal)   ├─ in parallel
                 ...                                    │
-                imaging_Vela_18 (afterok:verify_job)  ─┘
-                        └── move_images (afterany:all imaging jobs)
-                                → /idia/projects/vela-mc-blos/images/<obs_id>/
+                imaging_Vela_18 (afterok:verify_cal)  ─┘
+                        └── verify_imaging (afterany:all imaging jobs)
+                                └── linmos (afterok:verify_imaging)
+                                        └── move_images (afterany:linmos)
+                                                → /idia/projects/vela-mc-blos/images/<obs_id>/
 ```
 
-- **afterany** for verification: runs even if calibration fails, so
+- **afterany** for verify_cal: runs even if calibration fails, so
   failures are logged.
-- **afterok** for imaging: only runs if verification passes.
-- **afterany** for image-move: runs after all imaging jobs finish
-  (success or failure), copying whatever was produced.
+- **afterok** for imaging: only runs if calibration verification passes.
+- **afterany** for verify_imaging: runs after all imaging jobs finish
+  (success or failure), to log results.
+- **afterok** for linmos: only runs if imaging verification passes.
+- **afterany** for move_images: runs after linmos finishes, copying
+  whatever was produced (per-field images + mosaic).
 
 Each target field is imaged independently in its own subdirectory
 (`imaging_Vela_00/`, `imaging_Vela_01/`, etc.) with its own config and
@@ -138,6 +145,8 @@ applied to both root-level and per-SPW sbatch files.
 |------|---------|
 | `slurm_utils.py` | Shared SLURM utilities (sbatch modification, job submission, script generation) |
 | `verify_calibration.py` | Post-calibration checks (caltable completeness, MMS existence); logs to `calibration_log.csv` |
+| `verify_imaging.py` | Post-imaging checks (`*.image` and `*.pb` existence per field); logs to `imaging_log.csv` |
+| `run_linmos.py` | Linear mosaicking of per-field images via `casatasks.linearmosaic`; exports to FITS |
 | `vela_config_modifier.ini` | Default parameter overrides (tested on obs 1770051982) |
 
 ## Monitoring
@@ -148,6 +157,9 @@ squeue -u $USER
 
 # Check calibration verification result
 cat /scratch3/projects/vela-mc-blos/calibration_log.csv
+
+# Check imaging verification result
+cat /scratch3/projects/vela-mc-blos/imaging_log.csv
 
 # Check a specific job's log
 cat /scratch3/projects/vela-mc-blos/<obs_id>/verify_cal_<obs_id>-<jobid>.log
