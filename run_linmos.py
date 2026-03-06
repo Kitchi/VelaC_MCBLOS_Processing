@@ -90,16 +90,12 @@ def main():
     print("Output:   {}".format(output_base))
     print("=" * 60)
 
-    # Import CASA tasks
+    # Import CASA tools/tasks
     try:
-        # TODO : There is no linearmosaic casatask
-        # It lives within casatools.linearmosaic, and should
-        # be instantiated as lm = linearmosaic()
-        # lm.defineoutputimage(nx, ny, cellx, imagecenter="J2000 {RA} {DEC}", outputimage="output_name.image", outputweight="output_weight.image")
-        # lm.makemosaic(images=[list, of, images], weightimages = [list, of, weight, images])
-        from casatasks import linearmosaic, exportfits
+        from casatools import image as iatool, linearmosaic as lmtool
+        from casatasks import exportfits
     except ImportError:
-        print("ERROR: casatasks not available. Run inside the CASA container:")
+        print("ERROR: casatools/casatasks not available. Run inside the CASA container:")
         print("  singularity exec <container> python3 run_linmos.py --work-dir <path>")
         sys.exit(1)
 
@@ -124,16 +120,49 @@ def main():
 
     # Run linear mosaic
     output_image = '{}.image'.format(output_base)
+    output_weight = '{}.weight'.format(output_base)
     print("\nRunning linearmosaic with {} fields...".format(len(images)))
     print("  images: {}".format([os.path.basename(i) for i in images]))
     print("  pbs:    {}".format([os.path.basename(p) for p in pbs]))
     print("  output: {}".format(output_image))
 
-    linearmosaic(
-        images=images,
-        weightimages=pbs,
-        output=output_image,
-    )
+    # Get image dimensions and coordinate info from the first image
+    ia = iatool()
+    ia.open(images[0])
+    cs = ia.coordsys()
+    shape = ia.shape()
+    ia.close()
+
+    nx = int(shape[0])
+    ny = int(shape[1])
+    cellx = str(abs(cs.increment()['numeric'][0])) + 'rad'
+    ref_pixel = cs.referencepixel()['numeric']
+    ref_val = cs.referencevalue()['numeric']
+    # RA and DEC in degrees
+    import math
+    ra_deg = math.degrees(ref_val[0])
+    dec_deg = math.degrees(ref_val[1])
+    # Convert RA to hours
+    ra_h = ra_deg / 15.0
+    ra_hh = int(ra_h)
+    ra_mm = int((ra_h - ra_hh) * 60)
+    ra_ss = (ra_h - ra_hh - ra_mm / 60.0) * 3600
+    dec_sign = '+' if dec_deg >= 0 else '-'
+    dec_abs = abs(dec_deg)
+    dec_dd = int(dec_abs)
+    dec_mm = int((dec_abs - dec_dd) * 60)
+    dec_ss = (dec_abs - dec_dd - dec_mm / 60.0) * 3600
+    imagecenter = 'J2000 {:02d}h{:02d}m{:06.3f}s {}{:02d}d{:02d}m{:06.3f}s'.format(
+        ra_hh, ra_mm, ra_ss, dec_sign, dec_dd, dec_mm, dec_ss)
+    cs.done()
+
+    lm = lmtool()
+    lm.defineoutputimage(nx=nx, ny=ny, cellx=cellx,
+                         imagecenter=imagecenter,
+                         outputimage=output_image,
+                         outputweight=output_weight)
+    lm.makemosaic(images=images, weightimages=pbs)
+    lm.done()
     print("Linear mosaic complete: {}".format(output_image))
 
     # Export to FITS

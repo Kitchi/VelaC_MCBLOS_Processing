@@ -43,7 +43,12 @@ RAW_BASE = '/idia/projects/vela-mc-blos/raw/SCI-20251102-MT-01'
 SCRATCH_BASE = '/scratch3/projects/vela-mc-blos'
 IMAGES_BASE = '/idia/projects/vela-mc-blos/images'
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_MODIFIER = os.path.join(SCRIPT_DIR, 'vela_config_modifier.ini')
+CUSTOM_DIR = os.path.join(SCRIPT_DIR, 'custom')
+DEFAULT_MODIFIER = (
+    os.path.join(CUSTOM_DIR, 'vela_config_modifier.ini')
+    if os.path.isfile(os.path.join(CUSTOM_DIR, 'vela_config_modifier.ini'))
+    else os.path.join(SCRIPT_DIR, 'vela_config_modifier.ini')
+)
 VERIFY_SCRIPT = os.path.join(SCRIPT_DIR, 'verify_calibration.py')
 VERIFY_IMAGING_SCRIPT = os.path.join(SCRIPT_DIR, 'verify_imaging.py')
 LINMOS_SCRIPT = os.path.join(SCRIPT_DIR, 'run_linmos.py')
@@ -78,10 +83,26 @@ def find_raw_ms(obs_id):
         print("ERROR: no .ms file found in {}".format(obs_dir))
         sys.exit(1)
 
-    # TODO : Offer the user a choice here in case of conflicts. Timeout after 1 min
-    # to select the first one
     if len(ms_files) > 1:
-        print("Warning: multiple MS files found, using first: {}".format(ms_files[0]))
+        ms_files.sort()
+        print("Multiple MS files found in {}:".format(obs_dir))
+        for idx, ms in enumerate(ms_files):
+            print("  [{}] {}".format(idx, os.path.basename(ms)))
+        print("Select a file (0-{}) [default: 0, timeout 60s]: ".format(len(ms_files) - 1),
+              end='', flush=True)
+        import select as _select
+        ready, _, _ = _select.select([sys.stdin], [], [], 60)
+        if ready:
+            choice = sys.stdin.readline().strip()
+            if choice.isdigit() and 0 <= int(choice) < len(ms_files):
+                return ms_files[int(choice)]
+            elif choice == '':
+                print("No input, using default: {}".format(os.path.basename(ms_files[0])))
+            else:
+                print("Invalid choice '{}', using default: {}".format(
+                    choice, os.path.basename(ms_files[0])))
+        else:
+            print("\nTimed out, using default: {}".format(os.path.basename(ms_files[0])))
 
     return ms_files[0]
 
@@ -122,9 +143,15 @@ def apply_modifier_to_config(config_file, modifier_sections):
             typed_params = {}
             for key, val in params.items():
                 try:
-                    typed_params[key] = ast.literal_eval(val)
+                    parsed = ast.literal_eval(val)
                 except (ValueError, SyntaxError):
-                    typed_params[key] = val
+                    parsed = val
+                # Strings must stay quoted so overwrite_config writes them
+                # as valid Python literals (e.g. '8s' not 8s)
+                if isinstance(parsed, str):
+                    typed_params[key] = "'{}'".format(parsed)
+                else:
+                    typed_params[key] = parsed
             cp.overwrite_config(config_file, conf_dict=typed_params, conf_sec=section)
         print("Applied modifier overrides to {}".format(config_file))
     except ImportError:
@@ -142,15 +169,59 @@ def apply_modifier_to_config(config_file, modifier_sections):
         print("Applied modifier overrides to {} (fallback mode)".format(config_file))
 
 
+def get_config_scripts(config_file):
+    """Extract all script names referenced in a pipeline config file."""
+    config = configparser.ConfigParser(allow_no_value=True)
+    config.read(config_file)
+    script_names = set()
+    for key in ('scripts', 'precal_scripts', 'postcal_scripts'):
+        if config.has_option('slurm', key):
+            raw = config.get('slurm', key)
+            try:
+                entries = ast.literal_eval(raw)
+                for entry in entries:
+                    if isinstance(entry, (list, tuple)) and len(entry) > 0:
+                        script_names.add(entry[0])
+                    elif isinstance(entry, str):
+                        script_names.add(entry)
+            except (ValueError, SyntaxError):
+                pass
+    return script_names
+
+
+def deploy_custom_scripts(custom_dir, work_dir, config_file):
+    """Copy custom .py scripts from custom_dir to work_dir.
+
+    Warns about scripts not referenced in the pipeline config.
+    """
+    if not os.path.isdir(custom_dir):
+        return
+    import shutil
+    custom_scripts = [f for f in os.listdir(custom_dir) if f.endswith('.py')]
+    if not custom_scripts:
+        return
+
+    config_scripts = get_config_scripts(config_file)
+
+    for script in custom_scripts:
+        src = os.path.join(custom_dir, script)
+        dst = os.path.join(work_dir, script)
+        shutil.copy2(src, dst)
+        print("Copied custom script: {}".format(script))
+
+    unmatched = [s for s in custom_scripts if s not in config_scripts]
+    if unmatched:
+        print("Warning: custom scripts not referenced in config: {}".format(
+            ', '.join(unmatched)))
+
+
 def run_processMeerKAT(args_str):
     """Run processMeerKAT.py with the given arguments."""
-    # TODO : 
-    # processMeerKAT.py first needs to be sourced to $PATH
-    # by running source /idia/software/pipelines/master/setup.sh
-    # Not sure if this can be done within a subprocess shell, but it needs to happen.
-    cmd = '{} {}'.format(PIPELINE_CMD, args_str)
+    cmd = 'source /idia/software/pipelines/master/setup.sh && {} {}'.format(
+        PIPELINE_CMD, args_str)
     print("Running: {}".format(cmd))
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                            executable='/bin/bash')
     if result.returncode != 0:
         print("STDOUT: {}".format(result.stdout))
         print("STDERR: {}".format(result.stderr))
@@ -284,8 +355,13 @@ def main():
                     if k not in ('selfcal', 'imaging')}
     apply_modifier_to_config(config_file, cal_sections)
 
+    # Step 4b: Deploy custom scripts to work dir (before -R picks them up)
+    deploy_custom_scripts(CUSTOM_DIR, work_dir, config_file)
+
     # Step 5: Generate scripts (does NOT submit since submit=False in config)
-    run_processMeerKAT('-R -C {}'.format(config_file))
+    # Use relative path — processMeerKAT's spw_split does string concatenation
+    # with the config path, so an absolute path breaks SPW directory creation.
+    run_processMeerKAT('-R -C {}'.format(os.path.basename(config_file)))
     print("Generated sbatch scripts")
 
     # Step 6: Apply sbatch overrides
