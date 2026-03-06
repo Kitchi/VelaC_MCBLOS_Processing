@@ -78,6 +78,8 @@ def find_raw_ms(obs_id):
         print("ERROR: no .ms file found in {}".format(obs_dir))
         sys.exit(1)
 
+    # TODO : Offer the user a choice here in case of conflicts. Timeout after 1 min
+    # to select the first one
     if len(ms_files) > 1:
         print("Warning: multiple MS files found, using first: {}".format(ms_files[0]))
 
@@ -142,6 +144,10 @@ def apply_modifier_to_config(config_file, modifier_sections):
 
 def run_processMeerKAT(args_str):
     """Run processMeerKAT.py with the given arguments."""
+    # TODO : 
+    # processMeerKAT.py first needs to be sourced to $PATH
+    # by running source /idia/software/pipelines/master/setup.sh
+    # Not sure if this can be done within a subprocess shell, but it needs to happen.
     cmd = '{} {}'.format(PIPELINE_CMD, args_str)
     print("Running: {}".format(cmd))
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
@@ -198,6 +204,7 @@ def setup_imaging_config(imaging_dir, modifier_sections, ms_path, target_field=N
     If target_field is specified, restricts imaging to that single field.
     Returns the path to the imaging config file.
     """
+
     imaging_config = os.path.join(imaging_dir, 'imaging_config.txt')
 
     # Build config from the calibrated data

@@ -92,6 +92,11 @@ def main():
 
     # Import CASA tasks
     try:
+        # TODO : There is no linearmosaic casatask
+        # It lives within casatools.linearmosaic, and should
+        # be instantiated as lm = linearmosaic()
+        # lm.defineoutputimage(nx, ny, cellx, imagecenter="J2000 {RA} {DEC}", outputimage="output_name.image", outputweight="output_weight.image")
+        # lm.makemosaic(images=[list, of, images], weightimages = [list, of, weight, images])
         from casatasks import linearmosaic, exportfits
     except ImportError:
         print("ERROR: casatasks not available. Run inside the CASA container:")
